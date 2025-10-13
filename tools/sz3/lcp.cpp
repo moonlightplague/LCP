@@ -14,6 +14,27 @@
 
 void usage() {
 
+    printf("Usage: lcp [options]\n");
+    printf("  -i <x> <y> <z>        Input data files, the particle positions of three dimensions to be compressed (required for compression)\n");
+    printf("  -z <compressed>       Output data / Input data files for the compressed data (required for compression/decompression)\n");
+    printf("  -o <x> <y> <z>        Output data files, the particle positions of three dimensions to be decompressed (may required for decompression)\n");
+    printf("  -osn                  The flag that determines the decompressed data files using input names with '.lcp.out' suffix (may required for decompression, -i required for the file names)\n");
+    printf("  -eb <value>           Absolute error bound (default 1e-3)\n");
+    printf("  -1 <n>                Process a single timestep with n particle points\n");
+    printf("  -2 <nt> <n>           Process nt timesteps each with n particle points\n");
+    printf("  -bt <block>           Temporal prediction batch size (default 16)\n");
+    printf("  -be <mode> [bx by bz] [DO NOT USE] Block size estimation method, do not use this if you don't know\n");
+    printf("  -fflag <value>        [DO NOT USE] Precision control for anchor frames, do not use this if you don't know\n");
+    printf("  -a                    Keep original data in memory for verification (-i required)\n");
+    printf("  -ord <32|64> <file>   Output data for permutation order indices using 32- or 64-bit integers\n");
+    printf("\n");
+    printf("Typical workflows:\n");
+    printf("  Compress:   lcp -i x.dat y.dat z.dat -1 <n> -eb <err> -z data.lcp\n");
+    printf("  Decompress: lcp -o x.out y.out z.out -1 <n> -z data.lcp\n");
+    printf("  Compress:   lcp -i x.dat y.dat z.dat -2 <nt> <n> -eb <err> -z data.lcp\n");
+    printf("  Decompress: lcp -o x.out y.out z.out -2 <nt> <n> -z data.lcp\n");
+    printf("\n");
+
     exit(0);
 }
 
