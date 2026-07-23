@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/lcp.dir/lcp.cpp.o -o lcp  -Wl,-rpath,/home/moonlightplague/projects/LCP/build/tools/zstd /usr/lib/gcc/x86_64-linux-gnu/13/libgomp.so /usr/lib/x86_64-linux-gnu/libpthread.a ../zstd/libzstd.so 

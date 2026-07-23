@@ -1,7 +1,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <limits>
 #include <random>
+#include <type_traits>
+#include <vector>
 #include <iostream>
 #include "SZ3/api/sz.hpp"
 #include "SZ3/compressor/SZDiscreteCompressor.hpp"
@@ -26,7 +31,10 @@ void usage() {
     printf("  -be <mode> [bx by bz] [DO NOT USE] Block size estimation method, do not use this if you don't know\n");
     printf("  -fflag <value>        [DO NOT USE] Precision control for anchor frames, do not use this if you don't know\n");
     printf("  -a                    Keep original data in memory for verification (-i required)\n");
-    printf("  -ord <32|64> <file>   Output data for permutation order indices using 32- or 64-bit integers\n");
+    printf("  -ord <32|64> <file>   Output permutation order using 32- or 64-bit words\n");
+    printf("                         Single-frame orders are block-local and bit-packed; multi-frame orders remain global\n");
+    printf("  --decompress-with-order <32|64> <file>\n");
+    printf("                         Apply an order file before writing decompressed particle coordinates\n");
     printf("\n");
     printf("Typical workflows:\n");
     printf("  Compress:   lcp -i x.dat y.dat z.dat -1 <n> -eb <err> -z data.lcp\n");
@@ -76,6 +84,239 @@ void sortAndVerify(T *a, T *b, size_t *ord, size_t n, std::string str) {
     delete[] c;
 }
 
+size_t blockOrderBitWidth(size_t block_size) {
+    size_t width = 0;
+    for (size_t max_index = block_size > 0 ? block_size - 1 : 0; max_index != 0; max_index >>= 1) {
+        ++width;
+    }
+    return width;
+}
+
+size_t blockOrderTotalBits(size_t n, const std::vector<size_t> &block_counts) {
+    size_t total_bits = 0;
+    size_t particle_count = 0;
+    for (size_t block_count: block_counts) {
+        const size_t width = blockOrderBitWidth(block_count);
+        if (width != 0 && block_count > (std::numeric_limits<size_t>::max() - total_bits) / width) {
+            printf("Blockwise order file is too large.\n");
+            exit(-1);
+        }
+        if (block_count > std::numeric_limits<size_t>::max() - particle_count) {
+            printf("Blockwise particle count is too large.\n");
+            exit(-1);
+        }
+        total_bits += block_count * width;
+        particle_count += block_count;
+    }
+
+    if (particle_count != n) {
+        printf("Block counts contain %zu particles, expected %zu.\n", particle_count, n);
+        exit(-1);
+    }
+    return total_bits;
+}
+
+template<class UInt>
+void writeBlockwiseOrderFile(const char *path, const size_t *order, size_t n,
+                             const std::vector<size_t> &block_counts) {
+    static_assert(std::is_unsigned<UInt>::value, "Order words must be unsigned integers");
+
+    constexpr size_t word_bits = std::numeric_limits<UInt>::digits;
+    const size_t total_bits = blockOrderTotalBits(n, block_counts);
+
+    const size_t word_count = total_bits / word_bits + (total_bits % word_bits != 0);
+    std::vector<UInt> words(word_count, 0);
+    size_t bit_position = 0;
+    size_t particle = 0;
+
+    for (size_t block_count: block_counts) {
+        const size_t width = blockOrderBitWidth(block_count);
+        for (size_t i = 0; i < block_count; ++i, ++particle) {
+            const size_t value = order[particle];
+            if (value >= block_count) {
+                printf("Invalid block-local order %zu for block population %zu.\n", value, block_count);
+                exit(-1);
+            }
+
+            size_t bits_written = 0;
+            while (bits_written < width) {
+                const size_t word_index = bit_position / word_bits;
+                const size_t word_offset = bit_position % word_bits;
+                const size_t chunk_bits = std::min(width - bits_written, word_bits - word_offset);
+                const UInt mask = chunk_bits == word_bits
+                                  ? std::numeric_limits<UInt>::max()
+                                  : (UInt(1) << chunk_bits) - 1;
+                const UInt chunk = static_cast<UInt>(value >> bits_written) & mask;
+                words[word_index] |= chunk << word_offset;
+                bit_position += chunk_bits;
+                bits_written += chunk_bits;
+            }
+        }
+    }
+
+    std::ofstream output(path, std::ios::binary);
+    if (!output) {
+        printf("Unable to open order file %s.\n", path);
+        exit(-1);
+    }
+    if (!words.empty()) {
+        output.write(reinterpret_cast<const char *>(words.data()), words.size() * sizeof(UInt));
+    }
+    output.close();
+    if (!output) {
+        printf("Unable to write order file %s.\n", path);
+        exit(-1);
+    }
+
+    printf("blockwise order file = %s (%zu bits, %zu %zu-bit words)\n",
+           path, total_bits, word_count, word_bits);
+}
+
+template<class UInt>
+std::vector<UInt> readOrderWords(const char *path, size_t word_count) {
+    if (word_count > std::numeric_limits<size_t>::max() / sizeof(UInt)) {
+        printf("Order file is too large.\n");
+        exit(-1);
+    }
+    const size_t expected_bytes = word_count * sizeof(UInt);
+
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input) {
+        printf("Unable to open order file %s.\n", path);
+        exit(-1);
+    }
+    const std::streamoff file_size = input.tellg();
+    if (file_size < 0 || static_cast<size_t>(file_size) != expected_bytes) {
+        printf("Order file %s has %lld bytes, expected %zu.\n",
+               path, static_cast<long long>(file_size), expected_bytes);
+        exit(-1);
+    }
+
+    std::vector<UInt> words(word_count);
+    input.seekg(0, std::ios::beg);
+    if (!words.empty()) {
+        input.read(reinterpret_cast<char *>(words.data()), expected_bytes);
+    }
+    if (!input) {
+        printf("Unable to read order file %s.\n", path);
+        exit(-1);
+    }
+    return words;
+}
+
+template<class UInt>
+std::vector<size_t> readBlockwiseOrderFile(const char *path, size_t n,
+                                           const std::vector<size_t> &block_counts) {
+    static_assert(std::is_unsigned<UInt>::value, "Order words must be unsigned integers");
+
+    constexpr size_t word_bits = std::numeric_limits<UInt>::digits;
+    const size_t total_bits = blockOrderTotalBits(n, block_counts);
+    const size_t word_count = total_bits / word_bits + (total_bits % word_bits != 0);
+    const std::vector<UInt> words = readOrderWords<UInt>(path, word_count);
+
+    std::vector<size_t> order(n);
+    size_t bit_position = 0;
+    size_t particle = 0;
+    for (size_t block_count: block_counts) {
+        const size_t width = blockOrderBitWidth(block_count);
+        std::vector<uchar> seen(block_count, 0);
+        for (size_t i = 0; i < block_count; ++i, ++particle) {
+            size_t value = 0;
+            size_t bits_read = 0;
+            while (bits_read < width) {
+                const size_t word_index = bit_position / word_bits;
+                const size_t word_offset = bit_position % word_bits;
+                const size_t chunk_bits = std::min(width - bits_read, word_bits - word_offset);
+                const UInt mask = chunk_bits == word_bits
+                                  ? std::numeric_limits<UInt>::max()
+                                  : (UInt(1) << chunk_bits) - 1;
+                const UInt chunk = (words[word_index] >> word_offset) & mask;
+                value |= static_cast<size_t>(chunk) << bits_read;
+                bit_position += chunk_bits;
+                bits_read += chunk_bits;
+            }
+
+            if (value >= block_count || seen[value]) {
+                printf("Order file %s does not contain a permutation for block population %zu.\n",
+                       path, block_count);
+                exit(-1);
+            }
+            seen[value] = 1;
+            order[particle] = value;
+        }
+    }
+
+    printf("blockwise order file applied = %s\n", path);
+    return order;
+}
+
+template<class UInt>
+std::vector<size_t> readGlobalOrderFile(const char *path, size_t n) {
+    const std::vector<UInt> words = readOrderWords<UInt>(path, n);
+    std::vector<size_t> order(n);
+    std::vector<uchar> seen(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        const size_t value = static_cast<size_t>(words[i]);
+        if (value >= n || seen[value]) {
+            printf("Order file %s is not a permutation of 0 through %zu.\n", path, n - 1);
+            exit(-1);
+        }
+        seen[value] = 1;
+        order[i] = value;
+    }
+
+    printf("global order file applied = %s\n", path);
+    return order;
+}
+
+std::vector<size_t> readBlockwiseOrderFile(const char *path, size_t word_bits, size_t n,
+                                           const std::vector<size_t> &block_counts) {
+    if (word_bits == 32) {
+        return readBlockwiseOrderFile<uint32_t>(path, n, block_counts);
+    }
+    if (word_bits == 64) {
+        return readBlockwiseOrderFile<uint64_t>(path, n, block_counts);
+    }
+    printf("Order word size must be 32 or 64.\n");
+    exit(-1);
+}
+
+std::vector<size_t> readGlobalOrderFile(const char *path, size_t word_bits, size_t n) {
+    if (word_bits == 32) {
+        return readGlobalOrderFile<uint32_t>(path, n);
+    }
+    if (word_bits == 64) {
+        return readGlobalOrderFile<uint64_t>(path, n);
+    }
+    printf("Order word size must be 32 or 64.\n");
+    exit(-1);
+}
+
+std::vector<size_t> getBlockwiseDestinations(const std::vector<size_t> &local_order,
+                                             const std::vector<size_t> &block_counts) {
+    std::vector<size_t> destinations(local_order.size());
+    size_t block_start = 0;
+    for (size_t block_count: block_counts) {
+        for (size_t i = 0; i < block_count; ++i) {
+            destinations[block_start + i] = block_start + local_order[block_start + i];
+        }
+        block_start += block_count;
+    }
+    return destinations;
+}
+
+template<class T>
+void applyOrder(T *datax, T *datay, T *dataz, size_t n, const std::vector<size_t> &destinations) {
+    std::vector<T> reordered(n);
+    T *data[3] = {datax, datay, dataz};
+    for (T *dimension: data) {
+        for (size_t i = 0; i < n; ++i) {
+            reordered[destinations[i]] = dimension[i];
+        }
+        memcpy(dimension, reordered.data(), n * sizeof(T));
+    }
+}
+
 template<class T>
 uchar *
 compressWithoutAllocateMemory(T *data, SZ3::Config &conf, size_t &outSize, size_t *ord = nullptr, uchar blkflag = 0x00,
@@ -98,14 +339,16 @@ compressWithoutAllocateMemory(T *data, SZ3::Config &conf, size_t &outSize, size_
 template<class T>
 uchar *
 compressWithoutAllocateMemory(T *datax, T *datay, T *dataz, SZ3::Config &conf, size_t &outSize, size_t *ord = nullptr,
-                              uchar blkflag = 0x00, size_t bx = 0, size_t by = 0, size_t bz = 0) {
+                              uchar blkflag = 0x00, size_t bx = 0, size_t by = 0, size_t bz = 0,
+                              size_t *blockwise_ord = nullptr, std::vector<size_t> *block_counts = nullptr) {
 
     size_t &n = conf.num;
 
     SZ3::SZDiscreteCompressor<T, SZ3::HuffmanEncoder<size_t>, SZ3::Lossless_zstd> compressor = SZ3::SZDiscreteCompressor<T, SZ3::HuffmanEncoder<size_t>, SZ3::Lossless_zstd>(
             SZ3::HuffmanEncoder<size_t>(), SZ3::Lossless_zstd());
 
-    uchar *bytes = compressor.compress(conf, datax, datay, dataz, outSize, ord, blkflag, bx, by, bz);
+    uchar *bytes = compressor.compress(conf, datax, datay, dataz, outSize, ord, blkflag, bx, by, bz,
+                                       blockwise_ord, block_counts);
 
     return bytes;
 }
@@ -147,12 +390,12 @@ uchar *compressWithAllocatedMemory(T *datax, T *datay, T *dataz, SZ3::Config con
 
 template<class T>
 void decompressWithoutAllocatedMemory(const uchar *cmpData, T *&datax, T *&datay, T *&dataz, size_t &outSize,
-                                      size_t cmpSize) {
+                                      size_t cmpSize, std::vector<size_t> *block_counts = nullptr) {
 
     static SZ3::SZDiscreteCompressor<T, SZ3::HuffmanEncoder<size_t>, SZ3::Lossless_zstd> compressor = SZ3::SZDiscreteCompressor<T, SZ3::HuffmanEncoder<size_t>, SZ3::Lossless_zstd>(
             SZ3::HuffmanEncoder<size_t>(), SZ3::Lossless_zstd());
 
-    compressor.decompressWithoutAllocateMemory(cmpData, datax, datay, dataz, outSize, cmpSize);
+    compressor.decompressWithoutAllocateMemory(cmpData, datax, datay, dataz, outSize, cmpSize, block_counts);
 }
 
 template<class T>
@@ -197,7 +440,8 @@ T *readFile(char *inPath[], size_t num_inPath, size_t n) {
 
 template<class T>
 void compress1(char *inPath[], size_t num_inPath, char *cmpPath, SZ3::Config conf, T *oridata = nullptr,
-               size_t *ord = nullptr, uchar blkflag = 0x00, size_t bx = 0, size_t by = 0, size_t bz = 0) {
+               size_t *ord = nullptr, uchar blkflag = 0x00, size_t bx = 0, size_t by = 0, size_t bz = 0,
+               size_t *blockwise_ord = nullptr, std::vector<size_t> *block_counts = nullptr) {
 
     T *data = readFile<T>(inPath, num_inPath, conf.num);
 
@@ -209,7 +453,8 @@ void compress1(char *inPath[], size_t num_inPath, char *cmpPath, SZ3::Config con
 
     T *datax = data, *datay = datax + conf.num, *dataz = datay + conf.num;
 
-    uchar *bytes = compressWithoutAllocateMemory<T>(datax, datay, dataz, conf, outSize, ord, blkflag, bx, by, bz);
+    uchar *bytes = compressWithoutAllocateMemory<T>(datax, datay, dataz, conf, outSize, ord, blkflag, bx, by, bz,
+                                                    blockwise_ord, block_counts);
     delete[] data;
 
     double compress_time = timer.stop();
@@ -429,7 +674,8 @@ void shuffle3(T *&data, size_t n) {
 //}
 
 template<class T>
-void decompress1(char *outPath[], size_t num_outPath, char *cmpPath, T *oridata = nullptr, size_t *ord = nullptr) {
+void decompress1(char *outPath[], size_t num_outPath, char *cmpPath, T *oridata = nullptr, size_t *ord = nullptr,
+                 const char *order_path = nullptr, size_t order_word_bits = 0) {
 
     size_t cmpSize;
     const auto cmpData = SZ3::readfile<uchar>(cmpPath, cmpSize);
@@ -438,10 +684,12 @@ void decompress1(char *outPath[], size_t num_outPath, char *cmpPath, T *oridata 
     T *datax = nullptr, *datay = nullptr, *dataz = nullptr;
 
     size_t n;
+    std::vector<size_t> block_counts;
 
     SZ3::Timer timer(true);
 
-    decompressWithoutAllocatedMemory(tailData, datax, datay, dataz, n, cmpSize);
+    decompressWithoutAllocatedMemory(tailData, datax, datay, dataz, n, cmpSize,
+                                     order_path == nullptr ? nullptr : &block_counts);
 
     double compress_time = timer.stop();
 
@@ -450,6 +698,13 @@ void decompress1(char *outPath[], size_t num_outPath, char *cmpPath, T *oridata 
         sortAndVerify(oridata, datax, ord, n, "x");
         sortAndVerify(oridata + n, datay, ord, n, "y");
         sortAndVerify(oridata + n + n, dataz, ord, n, "z");
+    }
+
+    if (order_path != nullptr) {
+        const std::vector<size_t> local_order =
+                readBlockwiseOrderFile(order_path, order_word_bits, n, block_counts);
+        const std::vector<size_t> destinations = getBlockwiseDestinations(local_order, block_counts);
+        applyOrder(datax, datay, dataz, n, destinations);
     }
 
     SZ3::writefile(outPath[0], datax, n);
@@ -462,7 +717,8 @@ void decompress1(char *outPath[], size_t num_outPath, char *cmpPath, T *oridata 
 }
 
 template<class T>
-void decompress2(char *outPath[], int num_outPath, char *cmpPath, T *oridata = nullptr, size_t *ord = nullptr) {
+void decompress2(char *outPath[], int num_outPath, char *cmpPath, T *oridata = nullptr, size_t *ord = nullptr,
+                 const char *order_path = nullptr, size_t order_word_bits = 0) {
 
     size_t cmpSize;
     const auto cmpData = SZ3::readfile<uchar>(cmpPath, cmpSize);
@@ -499,6 +755,12 @@ void decompress2(char *outPath[], int num_outPath, char *cmpPath, T *oridata = n
         sortAndVerify(oridata + 2 * nt * n, dataz, ord, nt * n, "z");
     }
 
+    if (order_path != nullptr) {
+        const std::vector<size_t> destinations =
+                readGlobalOrderFile(order_path, order_word_bits, nt * n);
+        applyOrder(datax, datay, dataz, nt * n, destinations);
+    }
+
     SZ3::writefile(outPath[0], datax, nt * n);
     SZ3::writefile(outPath[1], datay, nt * n);
     SZ3::writefile(outPath[2], dataz, nt * n);
@@ -510,7 +772,8 @@ void decompress2(char *outPath[], int num_outPath, char *cmpPath, T *oridata = n
 
 template<class T>
 void decompress2WithTemporalPrediction(char *outPath[], int num_outPath, char *cmpPath, T *oridata = nullptr,
-                                       size_t *ord = nullptr) {
+                                       size_t *ord = nullptr, const char *order_path = nullptr,
+                                       size_t order_word_bits = 0) {
 
     size_t cmpSize;
     const auto cmpData = SZ3::readfile<uchar>(cmpPath, cmpSize);
@@ -547,6 +810,12 @@ void decompress2WithTemporalPrediction(char *outPath[], int num_outPath, char *c
         sortAndVerify(oridata, datax, ord, nt * n, "x");
         sortAndVerify(oridata + nt * n, datay, ord, nt * n, "y");
         sortAndVerify(oridata + 2 * nt * n, dataz, ord, nt * n, "z");
+    }
+
+    if (order_path != nullptr) {
+        const std::vector<size_t> destinations =
+                readGlobalOrderFile(order_path, order_word_bits, nt * n);
+        applyOrder(datax, datay, dataz, nt * n, destinations);
     }
 
     SZ3::writefile(outPath[0], datax, nt * n);
@@ -641,9 +910,11 @@ signed main(int argc, char *argv[]) {
     for (int i = 0; i < 3; i++) outPath[i] = new char[1024];
     char cmpPath[1024];
     char ordPath[1024];
+    char inputOrdPath[1024];
 
-    uchar cmp = 0x00, decmp = 0x00, flag = 0x00, output_ord = 0x00;
+    uchar cmp = 0x00, decmp = 0x00, flag = 0x00, output_ord = 0x00, input_ord = 0x00;
     size_t ordBits = 64;
+    size_t inputOrdBits = 64;
     /*
      * flag = 1, compress without time dimension
      * flag = 2, compress with time dimension
@@ -735,12 +1006,27 @@ signed main(int argc, char *argv[]) {
                 printf("ordBits must be 32 or 64.\n");
                 exit(-1);
             }
-            sscanf(argv[i + 2], "%s", ordPath);
+            snprintf(ordPath, 1024, "%s", argv[i + 2]);
             output_ord = 0x01;
+            i += 2;
+        } else if (strcmp(argv[i], "--decompress-with-order") == 0) {
+            assert(i + 2 < argc);
+            sscanf(argv[i + 1], "%zu", &inputOrdBits);
+            if (inputOrdBits != 32 && inputOrdBits != 64) {
+                printf("Order word size must be 32 or 64.\n");
+                exit(-1);
+            }
+            snprintf(inputOrdPath, 1024, "%s", argv[i + 2]);
+            input_ord = 0x01;
             i += 2;
         } else {
             usage();
         }
+    }
+
+    if (input_ord && !decmp) {
+        printf("--decompress-with-order requires -o or -osn.\n");
+        exit(-1);
     }
 
     SZ3::Config conf(n);
@@ -750,6 +1036,8 @@ signed main(int argc, char *argv[]) {
 
     float *oridata = nullptr;
     size_t *ord = nullptr;
+    std::vector<size_t> blockwise_ord;
+    std::vector<size_t> block_counts;
 
     if (_a || output_ord) {
         if (cmp == 0x00) {
@@ -758,12 +1046,15 @@ signed main(int argc, char *argv[]) {
         }
         oridata = new float[conf.num * 3];
         ord = new size_t[conf.num];
+        if (output_ord && flag == 1) blockwise_ord.resize(conf.num);
     }
 
     if (cmp == 0x01) {
         switch (flag) {
             case 1: {
-                compress1<float>(inPath, 3, cmpPath, conf, oridata, ord, blkflag, bx, by, bz);
+                compress1<float>(inPath, 3, cmpPath, conf, oridata, ord, blkflag, bx, by, bz,
+                                 blockwise_ord.empty() ? nullptr : blockwise_ord.data(),
+                                 blockwise_ord.empty() ? nullptr : &block_counts);
                 break;
             }
             case 2: {
@@ -787,7 +1078,13 @@ signed main(int argc, char *argv[]) {
     }
 
     if (output_ord) {
-        if (ordBits == 32) {
+        if (flag == 1) {
+            if (ordBits == 32) {
+                writeBlockwiseOrderFile<uint32_t>(ordPath, blockwise_ord.data(), conf.num, block_counts);
+            } else {
+                writeBlockwiseOrderFile<uint64_t>(ordPath, blockwise_ord.data(), conf.num, block_counts);
+            }
+        } else if (ordBits == 32) {
             uint32_t *ordu32 = new uint32_t[conf.num];
             for (size_t i = 0; i < conf.num; i++) {
                 ordu32[i] = ord[i];
@@ -796,21 +1093,29 @@ signed main(int argc, char *argv[]) {
             delete[] ordu32;
         }
         else {
-            SZ3::writefile(ordPath, ord, conf.num);
+            uint64_t *ordu64 = new uint64_t[conf.num];
+            for (size_t i = 0; i < conf.num; i++) {
+                ordu64[i] = ord[i];
+            }
+            SZ3::writefile(ordPath, ordu64, conf.num);
+            delete[] ordu64;
         }
     }
 
     if (decmp == 0x01) {
         switch (flag) {
             case 1: {
-                decompress1<float>(outPath, 3, cmpPath, oridata, ord);
+                decompress1<float>(outPath, 3, cmpPath, oridata, ord,
+                                   input_ord ? inputOrdPath : nullptr, inputOrdBits);
                 break;
             }
             case 2: {
                 if (bt > 0) {
-                    decompress2WithTemporalPrediction<float>(outPath, 3, cmpPath, oridata, ord);
+                    decompress2WithTemporalPrediction<float>(outPath, 3, cmpPath, oridata, ord,
+                                                              input_ord ? inputOrdPath : nullptr, inputOrdBits);
                 } else {
-                    decompress2<float>(outPath, 3, cmpPath, oridata, ord);
+                    decompress2<float>(outPath, 3, cmpPath, oridata, ord,
+                                       input_ord ? inputOrdPath : nullptr, inputOrdBits);
                 }
                 break;
             }

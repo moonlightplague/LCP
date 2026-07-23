@@ -20,6 +20,7 @@
 #include <iostream>
 #include <random>
 #include <cmath>
+#include <unordered_map>
 
 #define __OUTPUT_INFO 0
 #define __soft_eb 0
@@ -640,7 +641,8 @@ namespace SZ3 {
 
         uchar *compressSimpleBlocking(const Config &conf, T *datax, T *datay, T *dataz, size_t &compressed_size,
                                       size_t *ord = nullptr, uchar blkflag = 0x03, size_t bx_ = 0, size_t by_ = 0,
-                                      size_t bz_ = 0) {
+                                      size_t bz_ = 0, size_t *blockwise_ord = nullptr,
+                                      std::vector<size_t> *block_counts = nullptr) {
 
             T rx = datax[0], ry = datay[0], rz = dataz[0], px = datax[0], py = datay[0], pz = dataz[0];
 //            T rx=0, ry=0, rz=0, px=0, py=0, pz=0;
@@ -703,6 +705,8 @@ namespace SZ3 {
                 tail_data += conf.num * sizeof(T);
 
                 if (ord != nullptr) std::iota(ord, ord + conf.num, 0);
+                if (blockwise_ord != nullptr) std::iota(blockwise_ord, blockwise_ord + conf.num, 0);
+                if (block_counts != nullptr) block_counts->assign(1, conf.num);
 
                 uchar *lossless_data = lossless.compress(bytes_data, tail_data - bytes_data, compressed_size);
                 delete[] bytes_data;
@@ -755,6 +759,8 @@ namespace SZ3 {
             {
 
                 NodeWithOrder *vec = new NodeWithOrder[conf.num]{};
+                size_t *local_ord = blockwise_ord == nullptr ? nullptr : new size_t[conf.num];
+                std::unordered_map<size_t, size_t> original_block_counts;
 
                 for (size_t i = 0; i < conf.num; i++) {
 
@@ -787,16 +793,25 @@ namespace SZ3 {
                     size_t cz = z / bz;
                     size_t dz = z % bz;
 
-                    NodeWithOrder tem(cx / 2 + cy / 2 * nx + cz / 2 * nx * ny,
+                    const size_t bid_x = cx / 2;
+                    const size_t bid_y = cy / 2;
+                    const size_t bid_z = cz / 2;
+                    const size_t block_id = bid_x + nx * bid_y + nx * ny * bid_z;
+
+                    NodeWithOrder tem(block_id,
                                       (dx + dy * bx + dz * bx * by) | ((cx & 1) << 60) | ((cy & 1) << 61) |
                                       ((cz & 1) << 62), i);
                     vec[i] = tem;
+                    if (local_ord != nullptr) {
+                        local_ord[i] = original_block_counts[block_id]++;
+                    }
                 }
 
                 radix_sort<NodeWithOrder>(vec, vec + conf.num);
 
                 for (size_t i = 0; i < conf.num; i++) {
                     ord[i] = vec[i].ord;
+                    if (blockwise_ord != nullptr) blockwise_ord[i] = local_ord[vec[i].ord];
                 }
 
                 for (size_t i = 1; i < conf.num; i++) {
@@ -841,7 +856,10 @@ namespace SZ3 {
                     prereid = reid;
                 }
 
+                if (block_counts != nullptr) block_counts->assign(blkcnt, blkcnt + blknum);
+
                 delete[] vec;
+                delete[] local_ord;
             }
 
 //            printf("blknum = %zu, conf.num = %zu, ratio = %lf\n", blknum, conf.num, 1. * conf.num / blknum);
@@ -2474,9 +2492,11 @@ namespace SZ3 {
         }
 
         uchar *compress(const Config &conf, T *datax, T *datay, T *dataz, size_t &compressed_size,
-                        size_t *ord = nullptr, uchar blkflag = 0x00, size_t bx = 0, size_t by = 0, size_t bz = 0) {
+                        size_t *ord = nullptr, uchar blkflag = 0x00, size_t bx = 0, size_t by = 0, size_t bz = 0,
+                        size_t *blockwise_ord = nullptr, std::vector<size_t> *block_counts = nullptr) {
 
-            return compressSimpleBlocking(conf, datax, datay, dataz, compressed_size, ord, blkflag, bx, by, bz);
+            return compressSimpleBlocking(conf, datax, datay, dataz, compressed_size, ord, blkflag, bx, by, bz,
+                                          blockwise_ord, block_counts);
         }
 
         /*
@@ -2489,7 +2509,7 @@ namespace SZ3 {
          */
 
         void decompressSimpleBlocking(const uchar *&lossless_data, T *&datax, T *&datay, T *&dataz, size_t &outSize,
-                                      size_t cmpSize) {
+                                      size_t cmpSize, std::vector<size_t> *block_counts = nullptr) {
 
             uchar const *cmpData;
 //            if(cmpSize > 0){
@@ -2533,6 +2553,8 @@ namespace SZ3 {
                 memcpy(dataz, cmpData + (conf.num + conf.num) * sizeof(T), conf.num * sizeof(T));
                 for (size_t i = 0; i < conf.num; i++) dataz[i] += pz;
 
+                if (block_counts != nullptr) block_counts->assign(1, conf.num);
+
                 return;
             }
 
@@ -2548,6 +2570,7 @@ namespace SZ3 {
 
             encoder.load(cmpData, remaining_length);
             auto blkcnt = encoder.decode(cmpData, blknum);
+            if (block_counts != nullptr) *block_counts = blkcnt;
 
             encoder.load(cmpData, remaining_length);
             auto quads = encoder.decode(cmpData, conf.num);
@@ -2926,11 +2949,11 @@ namespace SZ3 {
 
         void
         decompressWithoutAllocateMemory(const uchar *&lossless_data, T *&datax, T *&datay, T *&dataz, size_t &outSize,
-                                        size_t cmpSize) {
+                                        size_t cmpSize, std::vector<size_t> *block_counts = nullptr) {
 
             datax = datay = dataz = nullptr;
             outSize = 0;
-            decompressSimpleBlocking(lossless_data, datax, datay, dataz, outSize, cmpSize);
+            decompressSimpleBlocking(lossless_data, datax, datay, dataz, outSize, cmpSize, block_counts);
         }
 
         void decompressWithAllocateMemory(const uchar *&lossless_data, T *&datax, T *&datay, T *&dataz, size_t &outSize,
@@ -2950,4 +2973,3 @@ namespace SZ3 {
 #undef __OUTPUT_INFO
 
 #endif
-
