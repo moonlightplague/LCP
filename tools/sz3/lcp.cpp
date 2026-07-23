@@ -32,7 +32,8 @@ void usage() {
     printf("  -fflag <value>        [DO NOT USE] Precision control for anchor frames, do not use this if you don't know\n");
     printf("  -a                    Keep original data in memory for verification (-i required)\n");
     printf("  -ord <32|64> <file>   Output permutation order using 32- or 64-bit words\n");
-    printf("                         Single-frame orders are block-local and bit-packed; multi-frame orders remain global\n");
+    printf("                         Orders are global unless --blockwise-ord is also specified\n");
+    printf("  --blockwise-ord       Use the bit-packed block-local order format (single-frame only)\n");
     printf("  --decompress-with-order <32|64> <file>\n");
     printf("                         Apply an order file before writing decompressed particle coordinates\n");
     printf("\n");
@@ -675,7 +676,7 @@ void shuffle3(T *&data, size_t n) {
 
 template<class T>
 void decompress1(char *outPath[], size_t num_outPath, char *cmpPath, T *oridata = nullptr, size_t *ord = nullptr,
-                 const char *order_path = nullptr, size_t order_word_bits = 0) {
+                 const char *order_path = nullptr, size_t order_word_bits = 0, bool blockwise_order = false) {
 
     size_t cmpSize;
     const auto cmpData = SZ3::readfile<uchar>(cmpPath, cmpSize);
@@ -689,7 +690,7 @@ void decompress1(char *outPath[], size_t num_outPath, char *cmpPath, T *oridata 
     SZ3::Timer timer(true);
 
     decompressWithoutAllocatedMemory(tailData, datax, datay, dataz, n, cmpSize,
-                                     order_path == nullptr ? nullptr : &block_counts);
+                                     order_path != nullptr && blockwise_order ? &block_counts : nullptr);
 
     double compress_time = timer.stop();
 
@@ -701,10 +702,16 @@ void decompress1(char *outPath[], size_t num_outPath, char *cmpPath, T *oridata 
     }
 
     if (order_path != nullptr) {
-        const std::vector<size_t> local_order =
-                readBlockwiseOrderFile(order_path, order_word_bits, n, block_counts);
-        const std::vector<size_t> destinations = getBlockwiseDestinations(local_order, block_counts);
-        applyOrder(datax, datay, dataz, n, destinations);
+        if (blockwise_order) {
+            const std::vector<size_t> local_order =
+                    readBlockwiseOrderFile(order_path, order_word_bits, n, block_counts);
+            const std::vector<size_t> destinations = getBlockwiseDestinations(local_order, block_counts);
+            applyOrder(datax, datay, dataz, n, destinations);
+        } else {
+            const std::vector<size_t> destinations =
+                    readGlobalOrderFile(order_path, order_word_bits, n);
+            applyOrder(datax, datay, dataz, n, destinations);
+        }
     }
 
     SZ3::writefile(outPath[0], datax, n);
@@ -913,6 +920,7 @@ signed main(int argc, char *argv[]) {
     char inputOrdPath[1024];
 
     uchar cmp = 0x00, decmp = 0x00, flag = 0x00, output_ord = 0x00, input_ord = 0x00;
+    bool blockwise_order = false;
     size_t ordBits = 64;
     size_t inputOrdBits = 64;
     /*
@@ -1009,6 +1017,8 @@ signed main(int argc, char *argv[]) {
             snprintf(ordPath, 1024, "%s", argv[i + 2]);
             output_ord = 0x01;
             i += 2;
+        } else if (strcmp(argv[i], "--blockwise-ord") == 0) {
+            blockwise_order = true;
         } else if (strcmp(argv[i], "--decompress-with-order") == 0) {
             assert(i + 2 < argc);
             sscanf(argv[i + 1], "%zu", &inputOrdBits);
@@ -1026,6 +1036,14 @@ signed main(int argc, char *argv[]) {
 
     if (input_ord && !decmp) {
         printf("--decompress-with-order requires -o or -osn.\n");
+        exit(-1);
+    }
+    if (blockwise_order && !output_ord && !input_ord) {
+        printf("--blockwise-ord requires -ord or --decompress-with-order.\n");
+        exit(-1);
+    }
+    if (blockwise_order && flag != 1) {
+        printf("--blockwise-ord requires single-frame mode (-1).\n");
         exit(-1);
     }
 
@@ -1046,7 +1064,7 @@ signed main(int argc, char *argv[]) {
         }
         oridata = new float[conf.num * 3];
         ord = new size_t[conf.num];
-        if (output_ord && flag == 1) blockwise_ord.resize(conf.num);
+        if (output_ord && blockwise_order) blockwise_ord.resize(conf.num);
     }
 
     if (cmp == 0x01) {
@@ -1078,7 +1096,7 @@ signed main(int argc, char *argv[]) {
     }
 
     if (output_ord) {
-        if (flag == 1) {
+        if (blockwise_order) {
             if (ordBits == 32) {
                 writeBlockwiseOrderFile<uint32_t>(ordPath, blockwise_ord.data(), conf.num, block_counts);
             } else {
@@ -1106,7 +1124,7 @@ signed main(int argc, char *argv[]) {
         switch (flag) {
             case 1: {
                 decompress1<float>(outPath, 3, cmpPath, oridata, ord,
-                                   input_ord ? inputOrdPath : nullptr, inputOrdBits);
+                                   input_ord ? inputOrdPath : nullptr, inputOrdBits, blockwise_order);
                 break;
             }
             case 2: {

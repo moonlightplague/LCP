@@ -41,6 +41,7 @@ The default datatype is 32 bit float numbers.
 | -bt [bath_size]                                    | The maximum number of frames within one batch                              |
 | -a                                                 | Output the compression results like the maximum absolute error, PSNR, etc. |
 | -ord [32\|64] [output_file]                        | Output the particle permutation order                                      |
+| --blockwise-ord                                    | Use packed block-local order for a single frame                            |
 | --decompress-with-order [32\|64] [order_file]      | Apply an order file during decompression                                   |
 
 [//]: # (|                                                    |                                                                            |)
@@ -53,8 +54,12 @@ The default datatype is 32 bit float numbers.
 
 ### Order file
 
-For a single frame (`-1`), particles are grouped by the nonempty spatial blocks stored in the compressed file. A block is
-numbered in x-major order:
+By default, `-ord` writes one raw 32- or 64-bit global original index per particle for both single-frame (`-1`) and
+multi-frame (`-2`) inputs. With `--decompress-with-order`, the decompressor applies that global permutation before
+writing the output coordinates.
+
+For a single frame, adding `--blockwise-ord` alongside `-ord` selects the packed block-local format instead. Particles
+are grouped by the nonempty spatial blocks stored in the compressed file. A block is numbered in x-major order:
 
 ```
 block_id = bid.x + bn.x * bid.y + bn.x * bn.y * bid.z
@@ -70,16 +75,13 @@ To restore a block's original relative order, decode its `c` ranks and assign
 stream determine `block_start`. This restores the spatial-block-wise order, but cannot recover interleaving between
 different blocks unless the original input was already block-contiguous.
 
-The decompressor performs this restoration when `--decompress-with-order` is present. The word size must match the size
-used to create the order file:
+The decompressor performs this restoration when `--blockwise-ord` is present alongside `--decompress-with-order`. The
+word size must match the size used to create the order file:
 
 ```
-lcp -z data.lcp -1 particle_count -o x.out y.out z.out --decompress-with-order 32 data.ord
+lcp -i x.dat y.dat z.dat -z data.lcp -1 particle_count -ord 32 data.ord --blockwise-ord
+lcp -z data.lcp -1 particle_count -o x.out y.out z.out --decompress-with-order 32 data.ord --blockwise-ord
 ```
-
-For multiple frames (`-2`), the order file retains the previous format: one raw 32- or 64-bit global original index per
-particle. With `--decompress-with-order`, the decompressor applies that global permutation before writing the output
-coordinates.
 
 # How to test:
 
